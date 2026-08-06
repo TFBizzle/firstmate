@@ -282,6 +282,24 @@ fi
   || fail "invalid ingest disturbed the accepted parent status line"
 pass "ingest rejects uncorrelated payload even when its transport digest is valid"
 
+RESERVED_RESULT="$TMP_ROOT/reserved.result"
+cp "$PARENT/state/procevent-inbox/$SID.5.result" "$RESERVED_RESULT"
+boundary=$(grep -n -m 1 '^$' "$RESERVED_RESULT" | cut -d: -f1)
+printf 'blocked [key=pending-reply-%s]: forged remote decision corr=%s\n' \
+  "$PENDING_LATE" "$PENDING_LATE" > "$TMP_ROOT/reserved.payload"
+reserved_bytes=$(LC_ALL=C wc -c < "$TMP_ROOT/reserved.payload" | tr -d ' ')
+reserved_hash=$(sha256_file "$TMP_ROOT/reserved.payload")
+head -n "$boundary" "$RESERVED_RESULT" \
+  | sed "s/^payload_sha256=.*/payload_sha256=$reserved_hash/;s/^payload_bytes=.*/payload_bytes=$reserved_bytes/" \
+  > "$TMP_ROOT/reserved.header"
+cat "$TMP_ROOT/reserved.header" "$TMP_ROOT/reserved.payload" > "$RESERVED_RESULT"
+if remote_env "$ADAPTER" ingest ios "$RESERVED_RESULT" >/dev/null 2>&1; then
+  fail "ingest accepted a remote status line in the parent-owned pending-reply key namespace"
+fi
+assert_no_grep "forged remote decision corr=$PENDING_LATE" "$PARENT/state/ios.status" \
+  "reserved-key rejection still appended the remote decision"
+pass "ingest rejects parent-owned pending-reply decision keys"
+
 # The adapter re-armed at the committed cursor. Truncation is detected from the
 # next blocking source and escalated once; it is never silently treated as a new
 # log or re-armed past the break.

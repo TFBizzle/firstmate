@@ -238,12 +238,14 @@ fetch_document() { # <id> <remote-relative> <result-var>
 }
 
 line_valid() { # <line>
-  local line=$1 bytes
+  local line=$1 bytes key
   [ -n "$line" ] || return 1
   bytes=$(printf '%s' "$line" | LC_ALL=C wc -c | tr -d ' ')
   [ "$bytes" -le "$MAX_LINE_BYTES" ] || return 1
   [ -z "$(printf '%s' "$line" | LC_ALL=C tr -d '\11\40-\176')" ] || return 1
   printf '%s' "$line" | grep -Eq '^(working|needs-decision|blocked|paused|done|failed|resolved)([[:space:]]+\[[^]]+\])?:' || return 1
+  key=$(_fm_decision_key "$line") || key=''
+  case "$key" in pending-reply-*) return 1 ;; esac
   printf '%s' "$line" | grep -Eq 'corr=[A-Fa-f0-9]{16}'
 }
 

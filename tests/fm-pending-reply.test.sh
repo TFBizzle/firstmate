@@ -414,7 +414,7 @@ test_foreign_blocker_is_not_selected_as_escalation() {
 }
 
 test_concurrent_resolution_closes_escalation_once() {
-  local home state corr rec worker
+  local home state corr rec
   home=$(setup_parent concurrent-resolution)
   state="$home/state"
   export FM_PENDING_REPLY_NOW=4800
@@ -427,7 +427,7 @@ test_concurrent_resolution_closes_escalation_once() {
     "$corr" "$corr" > "$state/hibit.status"
   printf 'done [corr=%s]: concurrent delayed reply\n' "$corr" >> "$state/hibit.status"
 
-  for worker in 1 2 3 4 5 6 7 8; do
+  for _ in 1 2 3 4 5 6 7 8; do
     fm_pending_reply_try_resolve "$state" "$corr" &
   done
   wait

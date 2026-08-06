@@ -344,7 +344,7 @@ test_legacy_escalation_closes_default_decision() {
   rec=$(fm_pending_reply_path "$state" "$corr")
   fm_pending_reply_set "$rec" phase escalated
   fm_pending_reply_set "$rec" escalated_epoch 4700
-  printf 'blocked: pending-reply-missed: task=hibit pending-reply-id=%s\n' "$corr" \
+  printf 'blocked: pending-reply-missed: task=hibit pending-reply-id=%s request=legacy close\n' "$corr" \
     > "$state/hibit.status"
   printf 'done [corr=%s]: delayed legacy reply\n' "$corr" >> "$state/hibit.status"
 
@@ -368,7 +368,7 @@ test_legacy_escalation_does_not_close_taken_default_decision() {
   rec=$(fm_pending_reply_path "$state" "$corr")
   fm_pending_reply_set "$rec" phase escalated
   fm_pending_reply_set "$rec" escalated_epoch 4700
-  printf 'blocked: pending-reply-missed: task=hibit pending-reply-id=%s\n' "$corr" \
+  printf 'blocked: pending-reply-missed: task=hibit pending-reply-id=%s request=legacy escalation\n' "$corr" \
     > "$state/hibit.status"
   printf 'blocked: unrelated operator decision\n' >> "$state/hibit.status"
   printf 'done [corr=%s]: delayed legacy reply\n' "$corr" >> "$state/hibit.status"
@@ -384,6 +384,35 @@ test_legacy_escalation_does_not_close_taken_default_decision() {
   pass "legacy escalation cannot close an unrelated default-key decision"
 }
 
+test_foreign_blocker_is_not_selected_as_escalation() {
+  local home state corr rec open
+  home=$(setup_parent foreign-blocker)
+  state="$home/state"
+  export FM_PENDING_REPLY_NOW=4775
+  export FM_PENDING_REPLY_SEND_HOOK=true
+  corr=$(fm_pending_reply_create "$home" "$state" "hibit" "foreign blocker")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  fm_pending_reply_mark_turn_completed "$state" "$corr" request
+  fm_pending_reply_send_recovery "$state" "$corr" || fail "recovery send failed"
+  fm_pending_reply_mark_turn_completed "$state" "$corr" recovery
+  fm_pending_reply_maybe_escalate "$state" "$corr" || fail "genuine escalation failed"
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  printf 'blocked [key=release]: foreign decision pending-reply-id=%s corr=%s\n' \
+    "$corr" "$corr" >> "$state/hibit.status"
+
+  fm_pending_reply_try_resolve "$state" "$corr" || fail "correlated foreign blocker should resolve the record"
+  open=$(status_open_decisions "$state/hibit.status")
+  assert_contains "$open" $'release\tblocked\tforeign decision' \
+    "pending-reply closure cleared the foreign release decision"
+  assert_not_contains "$open" "pending-reply-$corr" \
+    "genuine keyed escalation remained open"
+  assert_no_grep 'resolved [key=release]: pending-reply-resolved:' "$state/hibit.status" \
+    "foreign release decision was selected as the pending-reply escalation"
+  [ -n "$(fm_pending_reply_get "$rec" escalation_closed_epoch)" ] \
+    || fail "genuine keyed escalation closure was not recorded"
+  pass "foreign correlated blocker cannot impersonate a pending-reply escalation"
+}
+
 test_concurrent_resolution_closes_escalation_once() {
   local home state corr rec worker
   home=$(setup_parent concurrent-resolution)
@@ -394,7 +423,7 @@ test_concurrent_resolution_closes_escalation_once() {
   rec=$(fm_pending_reply_path "$state" "$corr")
   fm_pending_reply_set "$rec" phase escalated
   fm_pending_reply_set "$rec" escalated_epoch 4750
-  printf 'blocked [key=pending-reply-%s]: pending-reply-missed: task=hibit pending-reply-id=%s\n' \
+  printf 'blocked [key=pending-reply-%s]: pending-reply-missed: task=hibit pending-reply-id=%s request=concurrent resolution\n' \
     "$corr" "$corr" > "$state/hibit.status"
   printf 'done [corr=%s]: concurrent delayed reply\n' "$corr" >> "$state/hibit.status"
 
@@ -1020,6 +1049,7 @@ test_second_missed_turn_escalates_once_and_stays_durable
 test_escalation_publication_failure_retries
 test_legacy_escalation_closes_default_decision
 test_legacy_escalation_does_not_close_taken_default_decision
+test_foreign_blocker_is_not_selected_as_escalation
 test_concurrent_resolution_closes_escalation_once
 test_concurrent_escalation_yields_to_late_reply
 test_transport_success_is_not_reply_success

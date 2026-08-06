@@ -822,20 +822,46 @@ fm_pending_reply_escalation_key() {  # <corr_id>
   printf 'pending-reply-%s' "$1"
 }
 
+fm_pending_reply_escalation_payload() {  # <record-path> <kind>
+  local rec=$1 kind=$2 task_id corr summary outcome token
+  task_id=$(fm_pending_reply_get "$rec" task_id)
+  corr=$(fm_pending_reply_get "$rec" corr_id)
+  summary=$(fm_pending_reply_get "$rec" request_summary)
+  [ -n "$task_id" ] && [ -n "$corr" ] || return 1
+  case "$kind" in
+    missed)
+      token=pending-reply-missed
+      ;;
+    delivery-unknown)
+      token=pending-reply-delivery-unknown
+      ;;
+    recovery-delivery)
+      outcome=$(fm_pending_reply_get "$rec" recovery_delivery_outcome)
+      case "$outcome" in failed|unknown) ;; *) return 1 ;; esac
+      token="pending-reply-recovery-delivery-$outcome"
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s: task=%s pending-reply-id=%s request=%s' "$token" "$task_id" "$corr" "$summary"
+}
+
 # The escalation line this library published for <corr_id>, or empty. A legacy
 # unkeyed escalation is matched and closed under the shared default key while
 # that exact escalation remains open. If an unrelated decision has since taken
 # over that key, the close is withheld so the unrelated decision is not cleared.
-fm_pending_reply_escalation_line() {  # <status-file> <corr_id>
-  local status_file=$1 corr=$2 line found=''
+fm_pending_reply_escalation_line() {  # <status-file> <record-path> <corr_id>
+  local status_file=$1 rec=$2 corr=$3 line found='' kind payload own_key
   [ -f "$status_file" ] || return 0
+  [ "$(fm_pending_reply_get "$rec" corr_id)" = "$corr" ] || return 0
+  own_key=$(fm_pending_reply_escalation_key "$corr")
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      *"pending-reply-id=$corr"*) ;;
-      *) continue ;;
-    esac
     [ "$(status_line_verb "$line")" = blocked ] || continue
-    found=$line
+    for kind in missed delivery-unknown recovery-delivery; do
+      payload=$(fm_pending_reply_escalation_payload "$rec" "$kind") || continue
+      case "$line" in
+        "blocked [key=$own_key]: $payload"|"blocked: $payload") found=$line; break ;;
+      esac
+    done
   done < "$status_file"
   printf '%s' "$found"
 }
@@ -867,7 +893,7 @@ _fm_pending_reply_close_escalation_locked() {  # <state-dir> <corr_id>
   [ -z "$closed" ] || return 0
   parent_status=$(fm_pending_reply_get "$rec" parent_status)
   [ -n "$parent_status" ] || return 1
-  escalation=$(fm_pending_reply_escalation_line "$parent_status" "$corr")
+  escalation=$(fm_pending_reply_escalation_line "$parent_status" "$rec" "$corr")
   if [ -n "$escalation" ]; then
     key=$(_fm_decision_key "$escalation") || key=''
     note=$(status_line_note "$escalation")
@@ -906,7 +932,7 @@ fm_pending_reply_maybe_escalate() (  # <state-dir> <corr_id>
 
 _fm_pending_reply_maybe_escalate_locked() {  # <state-dir> <corr_id>
   local state=$1 corr=$2
-  local rec phase completed now task_id summary payload parent_status outcome line
+  local rec phase completed now payload parent_status line kind
   rec=$(fm_pending_reply_path "$state" "$corr")
   [ -f "$rec" ] || return 1
   phase=$(fm_pending_reply_get "$rec" phase)
@@ -927,21 +953,13 @@ _fm_pending_reply_maybe_escalate_locked() {  # <state-dir> <corr_id>
   if _fm_pending_reply_try_resolve_locked "$state" "$corr"; then
     return 0
   fi
-  task_id=$(fm_pending_reply_get "$rec" task_id)
-  summary=$(fm_pending_reply_get "$rec" request_summary)
   parent_status=$(fm_pending_reply_get "$rec" parent_status)
-  # Use pending-reply-id= (not corr=) so this parent-written line cannot be
-  # mistaken for a secondmate acknowledgement by fm_pending_reply_line_resolves.
-  outcome=$(fm_pending_reply_get "$rec" recovery_delivery_outcome)
   case "$phase" in
-    delivery_unknown)
-      payload="pending-reply-delivery-unknown: task=${task_id} pending-reply-id=${corr} request=${summary}"
-      ;;
-    recovery_failed|recovery_unknown)
-      payload="pending-reply-recovery-delivery-${outcome}: task=${task_id} pending-reply-id=${corr} request=${summary}"
-      ;;
-    *) payload="pending-reply-missed: task=${task_id} pending-reply-id=${corr} request=${summary}" ;;
+    delivery_unknown) kind=delivery-unknown ;;
+    recovery_failed|recovery_unknown) kind=recovery-delivery ;;
+    *) kind=missed ;;
   esac
+  payload=$(fm_pending_reply_escalation_payload "$rec" "$kind") || return 1
   [ -n "$parent_status" ] || return 1
   mkdir -p "$(dirname "$parent_status")" 2>/dev/null || return 1
   line="blocked [key=$(fm_pending_reply_escalation_key "$corr")]: $payload"

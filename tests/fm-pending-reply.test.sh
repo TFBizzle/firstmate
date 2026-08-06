@@ -390,6 +390,33 @@ test_concurrent_resolution_closes_escalation_once() {
   pass "concurrent resolution closes one keyed escalation exactly once"
 }
 
+test_concurrent_escalation_yields_to_late_reply() {
+  local home state corr rec worker
+  home=$(setup_parent concurrent-escalation)
+  state="$home/state"
+  export FM_PENDING_REPLY_NOW=4900
+  corr=$(fm_pending_reply_create "$home" "$state" "hibit" "concurrent escalation")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  fm_pending_reply_set "$rec" phase recovery_sent
+  fm_pending_reply_set "$rec" recovery_turn_completed_epoch 4850
+  printf 'done [corr=%s]: late concurrent reply\n' "$corr" > "$state/hibit.status"
+
+  for worker in 1 2 3 4 5 6 7 8; do
+    fm_pending_reply_maybe_escalate "$state" "$corr" &
+    fm_pending_reply_try_resolve "$state" "$corr" &
+  done
+  wait
+
+  [ "$(phase_of "$state" "$corr")" = resolved ] \
+    || fail "concurrent escalation overwrote a resolved expectation"
+  assert_no_grep "pending-reply-id=$corr" "$state/hibit.status" \
+    "concurrent escalation published a false missed-reply blocker"
+  [ -z "$(fm_pending_reply_get "$rec" escalated_epoch)" ] \
+    || fail "concurrent escalation committed after the reply resolved"
+  pass "concurrent escalation yields to a late correlated reply"
+}
+
 test_transport_success_is_not_reply_success() {
   local home state corr
   home=$(setup_parent transport-not-reply)
@@ -971,6 +998,7 @@ test_second_missed_turn_escalates_once_and_stays_durable
 test_escalation_publication_failure_retries
 test_legacy_escalation_does_not_close_default_decision
 test_concurrent_resolution_closes_escalation_once
+test_concurrent_escalation_yields_to_late_reply
 test_transport_success_is_not_reply_success
 test_undelivered_records_are_scan_immutable
 test_delivery_confirmation_fallback_reconciles

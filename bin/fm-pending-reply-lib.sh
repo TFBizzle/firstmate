@@ -892,7 +892,18 @@ EOF
 
 # Escalate once after a missed recovery report or failed delivery outcome.
 # Retains the durable unresolved record. Never loops.
-fm_pending_reply_maybe_escalate() {  # <state-dir> <corr_id>
+fm_pending_reply_maybe_escalate() (  # <state-dir> <corr_id>
+  local state=$1 corr=$2 lock
+  lock="$state/.pending-reply-$corr.lock"
+  STATE=$state
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$_FM_PENDING_REPLY_LIB_DIR/fm-wake-lib.sh"
+  fm_lock_acquire_wait "$lock" || return 1
+  trap 'fm_lock_release "$lock"' EXIT
+  _fm_pending_reply_maybe_escalate_locked "$@"
+)
+
+_fm_pending_reply_maybe_escalate_locked() {  # <state-dir> <corr_id>
   local state=$1 corr=$2
   local rec phase completed now task_id summary payload parent_status outcome line
   rec=$(fm_pending_reply_path "$state" "$corr")
@@ -912,7 +923,7 @@ fm_pending_reply_maybe_escalate() {  # <state-dir> <corr_id>
     *) return 1 ;;
   esac
   # Resolve wins if a late report arrived between completion and this call.
-  if fm_pending_reply_try_resolve "$state" "$corr"; then
+  if _fm_pending_reply_try_resolve_locked "$state" "$corr"; then
     return 0
   fi
   task_id=$(fm_pending_reply_get "$rec" task_id)

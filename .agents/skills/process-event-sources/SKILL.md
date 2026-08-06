@@ -4,7 +4,8 @@ description: >-
   Agent-only procedure for registered process-to-event sources and their wakes.
   Use before arming a long-polling source firstmate owns, and on any
   `procevent <adapter> <source-id> <sequence>` check wake.
-  Owns the arming commands, the durable result read, the handled
+  Owns the arming commands, the durable result read, which wakes must be
+  routed to their adapter instead of acknowledged generically, the handled
   acknowledgement contract, the one-owner rule, the precise durability
   boundary, and the Lavish adapter's loss limitation.
 user-invocable: false
@@ -43,6 +44,11 @@ Two rules the commands cannot enforce for you:
 
 `procevent <adapter> <source-id> <sequence>`
 : The named durable result is waiting at `state/procevent-inbox/<source-id>.<sequence>.result`. Read that exact result; separate wakes identify later results independently.
+: **When the adapter owns applying the result, run the adapter, not the generic acknowledgement below.** The `<adapter>` field of the wake decides this, and `remote-reply` is such an adapter: a captured delta is applied only by
+  ```sh
+  bin/fm-procevent-remote-reply.sh handle <secondmate-id> <sequence> <result-file>
+  ```
+  where `<secondmate-id>` is the `<source-id>` with its `remote-reply-` prefix removed. That one call validates and ingests the delta into the secondmate's local status mirror, resolves the pending-reply expectations its correlation tokens name, re-arms the next cursor-anchored source, and makes the generic acknowledgement itself. The runner already makes this same call on capture, so a wake you are seeing has usually been applied before it reached you and this call is then an idempotent confirmation; it is not optional, because the wake arriving still unacknowledged is exactly the case where that automatic pass did not complete. Acknowledging such a wake generically instead retires it while dropping everything it carried: the reply never reaches the mirror, the request it answered keeps escalating as a missed report, and the relay stays unarmed until the next session start re-arms it. Reading the result is never a substitute for this call, and an adapter with no applying command is the only case where the generic path below is the whole job.
 : A captured result with no durable handled acknowledgement stays eligible for bounded re-announcement on the existing wake queue - across any number of drains and firstmate restarts, not only the crash window right after capture - until it is explicitly acknowledged. Once you have fully handled a result, durably record it:
   ```sh
   bin/fm-procevent.sh handled <source-id> <sequence>
@@ -61,6 +67,7 @@ Supported by tests:
 - the remote-reply adapter reads its append-only source non-destructively from an offset plus prefix hash, so a pre-capture retry can derive the same bytes again, while source truncation or replacement is detected rather than silently rebased;
 - proactive delivery and adapter-owned terminal retirement follow the operating contract in [`docs/configuration.md`](../../../docs/configuration.md);
 - a durably captured result with no handled acknowledgement remains eligible for bounded re-announcement across any number of drains and restarts, and repeat wakes retain the same source and sequence for deduplication;
+- a result whose application carries no judgement is applied by code, not by a handler: right after publishing, the runner has the owning adapter apply and acknowledge its own result, and the remote-reply adapter implements that, so a captured reply reaches its local status mirror and settles its correlated pending-reply expectation with no handler step - an adapter without that command, or one whose pass does not complete, simply leaves the result unacknowledged and therefore still announced;
 - the handled acknowledgement is generation-keyed to the exact source and sequence, private, path-safe, durable, and idempotent, and is the only thing that stops re-announcement;
 - one identity-matched owner per canonical source, across homes that share one underlying source store;
 - registration and ownership transitions share one per-source boundary, release is generation-bound, and uncertain process identity preserves the source for retry;

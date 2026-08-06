@@ -43,12 +43,24 @@
 #   recovery_turn_seen_busy=
 #   recovery_turn_completed_epoch=
 #   escalated_epoch=
+#   escalation_closed_epoch=
+#                           when the durable status decision opened by that
+#                           escalation was closed again (see the escalation
+#                           lifecycle note below); empty until then
 #   resolved_epoch=
 #   resolved_via=           status | document | helper | empty
 #   wrong_home_hits=        count of corr sightings under the secondmate home
 #   wrong_home_sightings=   comma-separated identities of counted sightings
 #   wrong_home_scan_signature=
 #   grace_secs=             bounded grace before recovery is eligible
+#
+# Escalation lifecycle: an escalation is not just a message, it OPENS a durable
+# keyed decision in the parent status log, and bin/fm-classify-lib.sh's fold is
+# the one owner of what closes it. So this library owns both ends of that
+# decision: fm_pending_reply_maybe_escalate opens it under a per-request key, and
+# fm_pending_reply_close_escalation closes it once the record resolves. Resolving
+# the record alone would leave the decision open forever, re-surfacing a settled
+# request in every later OPEN DECISIONS fold.
 #
 # Sourced by bin/fm-send.sh, bin/fm-watch.sh, bin/fm-secondmate-report.sh, and
 # tests. No side effects on source. set -u / set -e safe.
@@ -68,6 +80,8 @@ _FM_PENDING_REPLY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/n
 . "$_FM_PENDING_REPLY_LIB_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-tmux-lib.sh
 . "$_FM_PENDING_REPLY_LIB_DIR/fm-tmux-lib.sh"
+# shellcheck source=bin/fm-classify-lib.sh
+. "$_FM_PENDING_REPLY_LIB_DIR/fm-classify-lib.sh"
 
 FM_PENDING_REPLY_SCHEMA='fm-pending-reply.v1'
 FM_PENDING_REPLY_CORR_RE='corr=[A-Fa-f0-9]{16}'
@@ -479,6 +493,7 @@ fm_pending_reply_try_resolve() {  # <state-dir> <corr_id> [status-file-override]
   [ -f "$rec" ] || return 1
   phase=$(fm_pending_reply_get "$rec" phase)
   if [ "$phase" = resolved ]; then
+    fm_pending_reply_close_escalation "$state" "$corr" || true
     return 0
   fi
   delivered=$(fm_pending_reply_get "$rec" delivered_epoch)
@@ -512,6 +527,9 @@ fm_pending_reply_try_resolve() {  # <state-dir> <corr_id> [status-file-override]
   fi
   fm_pending_reply_set "$rec" resolved_epoch "$now" || return 1
   fm_pending_reply_set "$rec" resolved_via "$via" || return 1
+  # The record is resolved either way; a failed close stays retryable from the
+  # watcher tick rather than turning a settled request back into a failure.
+  fm_pending_reply_close_escalation "$state" "$corr" || true
   return 0
 }
 
@@ -786,11 +804,76 @@ fm_pending_reply_reconcile_recovery() {  # <state-dir> <corr_id>
   fm_pending_reply_set "$rec" phase recovery_unknown || return 1
 }
 
+# The decision key an escalation for <corr_id> opens in the parent status log.
+# Per-request rather than the bare default key, so one request's escalation
+# neither masks nor is masked by an unrelated decision on the same task.
+fm_pending_reply_escalation_key() {  # <corr_id>
+  printf 'pending-reply-%s' "$1"
+}
+
+# The escalation line this library published for <corr_id>, or empty. Read from
+# the parent status log rather than reconstructed, so a record escalated before
+# escalations carried a key is still matched by the close below.
+fm_pending_reply_escalation_line() {  # <status-file> <corr_id>
+  local status_file=$1 corr=$2 line found=''
+  [ -f "$status_file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *"pending-reply-id=$corr"*) ;;
+      *) continue ;;
+    esac
+    [ "$(status_line_verb "$line")" = blocked ] || continue
+    found=$line
+  done < "$status_file"
+  printf '%s' "$found"
+}
+
+# Close the durable status decision a previous escalation opened for <corr_id>.
+# Idempotent, and safe to retry until it succeeds: it appends the closing line
+# only while that exact decision is still open in bin/fm-classify-lib.sh's fold,
+# so it can neither double-close nor close a different decision that has since
+# taken over the same key. Records that never escalated are left untouched.
+fm_pending_reply_close_escalation() {  # <state-dir> <corr_id>
+  local state=$1 corr=$2 rec escalated closed parent_status escalation key note
+  local open_line open_key open_note now
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  [ -f "$rec" ] || return 1
+  [ "$(fm_pending_reply_get "$rec" phase)" = resolved ] || return 0
+  escalated=$(fm_pending_reply_get "$rec" escalated_epoch)
+  [ -n "$escalated" ] || return 0
+  closed=$(fm_pending_reply_get "$rec" escalation_closed_epoch)
+  [ -z "$closed" ] || return 0
+  parent_status=$(fm_pending_reply_get "$rec" parent_status)
+  [ -n "$parent_status" ] || return 1
+  escalation=$(fm_pending_reply_escalation_line "$parent_status" "$corr")
+  if [ -n "$escalation" ]; then
+    key=$(_fm_decision_key "$escalation") || key=''
+    note=$(status_line_note "$escalation")
+    while IFS= read -r open_line; do
+      [ -n "$open_line" ] || continue
+      open_key=${open_line%%$'\t'*}
+      [ "$open_key" = "$key" ] || continue
+      open_note=${open_line#*$'\t'}
+      open_note=${open_note#*$'\t'}
+      [ "$open_note" = "$note" ] || continue
+      printf 'resolved [key=%s]: pending-reply-resolved: task=%s pending-reply-id=%s via=%s\n' \
+        "$key" "$(fm_pending_reply_get "$rec" task_id)" "$corr" \
+        "$(fm_pending_reply_get "$rec" resolved_via)" \
+        >> "$parent_status" 2>/dev/null || return 1
+      break
+    done <<EOF
+$(status_open_decisions "$parent_status")
+EOF
+  fi
+  now=$(fm_pending_reply_now)
+  fm_pending_reply_set "$rec" escalation_closed_epoch "$now"
+}
+
 # Escalate once after a missed recovery report or failed delivery outcome.
 # Retains the durable unresolved record. Never loops.
 fm_pending_reply_maybe_escalate() {  # <state-dir> <corr_id>
   local state=$1 corr=$2
-  local rec phase completed now task_id summary payload parent_status outcome
+  local rec phase completed now task_id summary payload parent_status outcome line
   rec=$(fm_pending_reply_path "$state" "$corr")
   [ -f "$rec" ] || return 1
   phase=$(fm_pending_reply_get "$rec" phase)
@@ -828,8 +911,9 @@ fm_pending_reply_maybe_escalate() {  # <state-dir> <corr_id>
   esac
   [ -n "$parent_status" ] || return 1
   mkdir -p "$(dirname "$parent_status")" 2>/dev/null || return 1
-  if ! grep -Fqx "blocked: $payload" "$parent_status" 2>/dev/null; then
-    printf 'blocked: %s\n' "$payload" >> "$parent_status" 2>/dev/null || return 1
+  line="blocked [key=$(fm_pending_reply_escalation_key "$corr")]: $payload"
+  if ! grep -Fqx "$line" "$parent_status" 2>/dev/null; then
+    printf '%s\n' "$line" >> "$parent_status" 2>/dev/null || return 1
   fi
   now=$(fm_pending_reply_now)
   fm_pending_reply_set "$rec" escalated_epoch "$now" || return 1
@@ -969,7 +1053,12 @@ fm_pending_reply_tick() {  # <state-dir>
     [ -n "$corr" ] || corr=$(basename "$rec")
     task_id=$(fm_pending_reply_get "$rec" task_id)
     phase=$(fm_pending_reply_get "$rec" phase)
-    [ "$phase" != resolved ] || continue
+    if [ "$phase" = resolved ]; then
+      # Cheap no-op unless an escalation for this record is still open; this is
+      # the retry that makes the close converge after a transient write failure.
+      fm_pending_reply_close_escalation "$state" "$corr" || true
+      continue
+    fi
     fm_pending_reply_reconcile_delivery "$state" "$corr" || true
     phase=$(fm_pending_reply_get "$rec" phase)
     delivered=$(fm_pending_reply_get "$rec" delivered_epoch)

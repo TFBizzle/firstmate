@@ -51,6 +51,17 @@
 # only terminal verdict. A missing command, an error, or any other exit keeps the
 # registration armed, so an adapter that has no notion of ending needs no change.
 #
+# Applying a result is adapter-owned through the same kind of seam. Some results
+# carry no judgement at all - they must simply be applied, exactly once, to the
+# home's own durable state - and leaving that to an agent that has to remember
+# means it silently does not happen. So after publishing, `start` calls
+# `bin/fm-procevent-<adapter>.sh autohandle <source-id> <sequence> <result-file>`
+# and lets the adapter apply and acknowledge its own result. Exit 0 means the
+# adapter fully handled it. A missing command, an error, or any other exit is not
+# a failure of capture: the result stays unacknowledged and therefore eligible
+# for re-announcement, so the handler still receives it exactly as before. This
+# runner still inspects nothing and still names no adapter-specific condition.
+#
 # Ownership is machine-wide per canonical source, because separate Firstmate
 # homes can share one underlying source store. A live owner is never displaced;
 # only a claim whose whole generation is gone is reclaimed. A runner leads its
@@ -79,7 +90,7 @@ REG=$(fm_procevent_registry_dir "$STATE")
 MAX_OUTPUT_BYTES=${FM_PROCEVENT_MAX_OUTPUT_BYTES:-1048576}
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,63p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,74p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 adapter_script() { printf '%s/bin/fm-procevent-%s.sh\n' "$FM_ROOT" "$1"; }
 
@@ -97,6 +108,26 @@ adapter_result_is_terminal() {  # <adapter> <result-file>
 source_file()  { printf '%s/%s.source\n' "$REG" "$1"; }
 runner_file()  { printf '%s/%s.runner\n' "$REG" "$1"; }
 staging_file() { printf '%s/.%s.%s.output\n' "$REG" "$1" "$2"; }
+
+# Let the source's own adapter apply and acknowledge one captured result. See
+# the header for why this exists and what each exit means. An already
+# acknowledged result is skipped, so this is safe to call more than once for the
+# same generation. The adapter runs OUTSIDE any source-lock hold here, because a
+# handling adapter is expected to re-arm its own next source, which takes that
+# same lock.
+adapter_autohandle() {  # <adapter> <source-id> <result-file>
+  local adapter=$1 id=$2 result=$3 script seq
+  script=$(adapter_script "$adapter")
+  [ -f "$script" ] && [ ! -L "$script" ] || return 1
+  seq=$(fm_procevent_result_sequence "$result") || return 1
+  case "$seq" in ''|*[!0-9]*) return 1 ;; esac
+  fm_procevent_is_handled "$STATE" "$id" "$seq" && return 0
+  # Silenced exactly like the terminal seam above, so an adapter that has no
+  # such command is a quiet no-op rather than runner noise. This runner's own
+  # one-line outcome is the interface; an adapter that failed keeps its result
+  # announced, and the handler's own call reproduces the diagnostics in full.
+  "$script" autohandle "$id" "$seq" "$result" >/dev/null 2>&1
+}
 
 read_adapter() {  # <source-id>
   local f; f=$(source_file "$1")
@@ -334,6 +365,14 @@ cmd_start() {
     else
       printf 'cannot retire terminal source; it remains registered: %s\n' "$id" >&2
     fi
+  fi
+  # Strictly after the terminal retirement above: a handling adapter re-arms its
+  # own next source, and retiring afterwards would drop that fresh registration
+  # and leave the source silently dead.
+  if adapter_autohandle "$adapter" "$id" "$durable"; then
+    printf 'autohandled: %s\n' "$id"
+  else
+    printf 'not-autohandled: %s (left for the handler; still unacknowledged)\n' "$id" >&2
   fi
   printf 'captured: %s\n' "$durable"
 }

@@ -25,9 +25,9 @@
 # again on that wake is idempotent.
 #
 # Ingest accepts only bounded, printable status lines with an allowed lifecycle
-# verb and corr=<16hex>. Exact lines are appended at most once to the parent's
-# state/<id>.status. A data/*.md pointer is fetched through the path-confined
-# remote file reader and rewritten to its local private copy before append.
+# verb and corr=<16hex>, rejecting parent-owned pending-reply-* decision keys.
+# Exact lines are appended at most once to state/<id>.status; a data/*.md pointer
+# is fetched through the confined remote reader and copied locally before append.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

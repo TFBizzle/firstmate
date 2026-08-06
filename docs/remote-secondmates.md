@@ -159,7 +159,9 @@ FM_HOME=<primary-home> bin/fm-send.sh fm-<id> '<request>'
 
 Marked requests keep the existing correlation contract.
 The remote charter appends replies to `state/parent-replies.status` in the remote home.
-A process-event source performs a non-destructive, cursor-anchored delta read, validates bounded correlated status lines, fetches only referenced `data/*.md` documents through the confined reader, and appends each accepted line at most once to the primary status channel.
+A process-event source performs a non-destructive, cursor-anchored delta read, validates bounded correlated status lines, fetches only referenced `data/*.md` documents through the confined reader, and automatically applies each accepted line at most once to the primary status channel.
+An accepted correlated reply resolves its pending-reply record and closes that request's exact open escalation decision, while an application that does not complete stays unacknowledged for the documented handler retry path.
+The [process-to-event operating contract](configuration.md#process-to-event-sources-stateprocevent) owns that automatic application and retry boundary.
 The source log is never truncated or consumed.
 A shortened or changed prefix stops the relay and surfaces a continuity failure instead of silently resetting the cursor.
 

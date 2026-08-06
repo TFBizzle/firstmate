@@ -52,7 +52,7 @@
 # registration armed, so an adapter that has no notion of ending needs no change.
 #
 # Applying a result is adapter-owned through the same kind of seam. Some results
-# carry no judgement at all - they must simply be applied, exactly once, to the
+# carry no judgement at all - they must simply be applied idempotently to the
 # home's own durable state - and leaving that to an agent that has to remember
 # means it silently does not happen. So after publishing, `start` calls
 # `bin/fm-procevent-<adapter>.sh autohandle <source-id> <sequence> <result-file>`

@@ -822,7 +822,10 @@ fm_pending_reply_escalation_key() {  # <corr_id>
   printf 'pending-reply-%s' "$1"
 }
 
-# The escalation line this library published for <corr_id>, or empty.
+# The escalation line this library published for <corr_id>, or empty. A legacy
+# unkeyed escalation is matched and closed under the shared default key while
+# that exact escalation remains open. If an unrelated decision has since taken
+# over that key, the close is withheld so the unrelated decision is not cleared.
 fm_pending_reply_escalation_line() {  # <status-file> <corr_id>
   local status_file=$1 corr=$2 line found=''
   [ -f "$status_file" ] || return 0
@@ -840,8 +843,7 @@ fm_pending_reply_escalation_line() {  # <status-file> <corr_id>
 # Close the durable status decision a previous escalation opened for <corr_id>.
 # Idempotent, and safe to retry until it succeeds: it appends the closing line
 # only while that exact keyed decision is still open in
-# bin/fm-classify-lib.sh's fold. Records that never escalated and legacy
-# unkeyed escalations are left untouched.
+# bin/fm-classify-lib.sh's fold. Records that never escalated are left untouched.
 fm_pending_reply_close_escalation() (  # <state-dir> <corr_id>
   local state=$1 corr=$2 lock
   lock="$state/.pending-reply-$corr.lock"

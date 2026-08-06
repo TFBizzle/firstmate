@@ -485,7 +485,18 @@ fm_pending_reply_resolve_via_of_line() {  # <line>
 
 # Idempotently resolve an expectation from a correlated parent report.
 # Returns 0 when the record is resolved after the call (already or newly).
-fm_pending_reply_try_resolve() {  # <state-dir> <corr_id> [status-file-override]
+fm_pending_reply_try_resolve() (  # <state-dir> <corr_id> [status-file-override]
+  local state=$1 corr=$2 lock
+  lock="$state/.pending-reply-$corr.lock"
+  STATE=$state
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$_FM_PENDING_REPLY_LIB_DIR/fm-wake-lib.sh"
+  fm_lock_acquire_wait "$lock" || return 1
+  trap 'fm_lock_release "$lock"' EXIT
+  _fm_pending_reply_try_resolve_locked "$@"
+)
+
+_fm_pending_reply_try_resolve_locked() {  # <state-dir> <corr_id> [status-file-override]
   local state=$1 corr=$2 status_override=${3-}
   local rec phase delivered marker delivery_entry delivery_state status_file signature previous line via now
   local unconfirmed=0
@@ -493,7 +504,7 @@ fm_pending_reply_try_resolve() {  # <state-dir> <corr_id> [status-file-override]
   [ -f "$rec" ] || return 1
   phase=$(fm_pending_reply_get "$rec" phase)
   if [ "$phase" = resolved ]; then
-    fm_pending_reply_close_escalation "$state" "$corr" || true
+    _fm_pending_reply_close_escalation_locked "$state" "$corr" || true
     return 0
   fi
   delivered=$(fm_pending_reply_get "$rec" delivered_epoch)
@@ -529,7 +540,7 @@ fm_pending_reply_try_resolve() {  # <state-dir> <corr_id> [status-file-override]
   fm_pending_reply_set "$rec" resolved_via "$via" || return 1
   # The record is resolved either way; a failed close stays retryable from the
   # watcher tick rather than turning a settled request back into a failure.
-  fm_pending_reply_close_escalation "$state" "$corr" || true
+  _fm_pending_reply_close_escalation_locked "$state" "$corr" || true
   return 0
 }
 
@@ -831,7 +842,18 @@ fm_pending_reply_escalation_line() {  # <status-file> <corr_id>
 # only while that exact keyed decision is still open in
 # bin/fm-classify-lib.sh's fold. Records that never escalated and legacy
 # unkeyed escalations are left untouched.
-fm_pending_reply_close_escalation() {  # <state-dir> <corr_id>
+fm_pending_reply_close_escalation() (  # <state-dir> <corr_id>
+  local state=$1 corr=$2 lock
+  lock="$state/.pending-reply-$corr.lock"
+  STATE=$state
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$_FM_PENDING_REPLY_LIB_DIR/fm-wake-lib.sh"
+  fm_lock_acquire_wait "$lock" || return 1
+  trap 'fm_lock_release "$lock"' EXIT
+  _fm_pending_reply_close_escalation_locked "$@"
+)
+
+_fm_pending_reply_close_escalation_locked() {  # <state-dir> <corr_id>
   local state=$1 corr=$2 rec escalated closed parent_status escalation key note
   local open_line open_key open_note now
   rec=$(fm_pending_reply_path "$state" "$corr")

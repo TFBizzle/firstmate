@@ -362,6 +362,34 @@ test_legacy_escalation_does_not_close_default_decision() {
   pass "legacy escalation cannot close an unrelated default-key decision"
 }
 
+test_concurrent_resolution_closes_escalation_once() {
+  local home state corr rec worker
+  home=$(setup_parent concurrent-resolution)
+  state="$home/state"
+  export FM_PENDING_REPLY_NOW=4800
+  corr=$(fm_pending_reply_create "$home" "$state" "hibit" "concurrent resolution")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  fm_pending_reply_set "$rec" phase escalated
+  fm_pending_reply_set "$rec" escalated_epoch 4750
+  printf 'blocked [key=pending-reply-%s]: pending-reply-missed: task=hibit pending-reply-id=%s\n' \
+    "$corr" "$corr" > "$state/hibit.status"
+  printf 'done [corr=%s]: concurrent delayed reply\n' "$corr" >> "$state/hibit.status"
+
+  for worker in 1 2 3 4 5 6 7 8; do
+    fm_pending_reply_try_resolve "$state" "$corr" &
+  done
+  wait
+
+  [ "$(phase_of "$state" "$corr")" = resolved ] \
+    || fail "concurrent resolvers left the expectation unresolved"
+  [ "$(grep -Fc "pending-reply-resolved: task=hibit pending-reply-id=$corr" "$state/hibit.status")" -eq 1 ] \
+    || fail "concurrent resolvers did not append exactly one decision close"
+  [ -n "$(fm_pending_reply_get "$rec" escalation_closed_epoch)" ] \
+    || fail "concurrent resolution did not record the closed escalation"
+  pass "concurrent resolution closes one keyed escalation exactly once"
+}
+
 test_transport_success_is_not_reply_success() {
   local home state corr
   home=$(setup_parent transport-not-reply)
@@ -942,6 +970,7 @@ test_recovery_reply_resolves_original
 test_second_missed_turn_escalates_once_and_stays_durable
 test_escalation_publication_failure_retries
 test_legacy_escalation_does_not_close_default_decision
+test_concurrent_resolution_closes_escalation_once
 test_transport_success_is_not_reply_success
 test_undelivered_records_are_scan_immutable
 test_delivery_confirmation_fallback_reconciles

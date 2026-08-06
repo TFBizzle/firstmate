@@ -334,6 +334,34 @@ test_escalation_publication_failure_retries() {
   pass "failed escalation publication remains retryable and publishes once"
 }
 
+test_legacy_escalation_does_not_close_default_decision() {
+  local home state corr rec open
+  home=$(setup_parent legacy-escalation)
+  state="$home/state"
+  export FM_PENDING_REPLY_NOW=4750
+  corr=$(fm_pending_reply_create "$home" "$state" "hibit" "legacy escalation")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  fm_pending_reply_set "$rec" phase escalated
+  fm_pending_reply_set "$rec" escalated_epoch 4700
+  printf 'blocked: pending-reply-missed: task=hibit pending-reply-id=%s\n' "$corr" \
+    > "$state/hibit.status"
+  printf 'done [corr=%s]: delayed legacy reply\n' "$corr" >> "$state/hibit.status"
+
+  fm_pending_reply_try_resolve "$state" "$corr" || fail "legacy reply should resolve its record"
+  if grep -Fq 'resolved [key=default]: pending-reply-resolved:' "$state/hibit.status"; then
+    fail "legacy escalation emitted an unsafe default-key resolution"
+  fi
+  printf 'blocked: unrelated operator decision\n' >> "$state/hibit.status"
+  fm_pending_reply_tick "$state" || fail "legacy close retry failed"
+  open=$(status_open_decisions "$state/hibit.status")
+  assert_contains "$open" "unrelated operator decision" \
+    "legacy escalation closure hid an unrelated default-key decision"
+  [ -z "$(fm_pending_reply_get "$rec" escalation_closed_epoch)" ] \
+    || fail "legacy escalation was recorded as safely closed"
+  pass "legacy escalation cannot close an unrelated default-key decision"
+}
+
 test_transport_success_is_not_reply_success() {
   local home state corr
   home=$(setup_parent transport-not-reply)
@@ -913,6 +941,7 @@ test_recovery_attempt_is_never_reinjected
 test_recovery_reply_resolves_original
 test_second_missed_turn_escalates_once_and_stays_durable
 test_escalation_publication_failure_retries
+test_legacy_escalation_does_not_close_default_decision
 test_transport_success_is_not_reply_success
 test_undelivered_records_are_scan_immutable
 test_delivery_confirmation_fallback_reconciles

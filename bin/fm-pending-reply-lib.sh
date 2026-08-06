@@ -811,9 +811,7 @@ fm_pending_reply_escalation_key() {  # <corr_id>
   printf 'pending-reply-%s' "$1"
 }
 
-# The escalation line this library published for <corr_id>, or empty. Read from
-# the parent status log rather than reconstructed, so a record escalated before
-# escalations carried a key is still matched by the close below.
+# The escalation line this library published for <corr_id>, or empty.
 fm_pending_reply_escalation_line() {  # <status-file> <corr_id>
   local status_file=$1 corr=$2 line found=''
   [ -f "$status_file" ] || return 0
@@ -830,9 +828,9 @@ fm_pending_reply_escalation_line() {  # <status-file> <corr_id>
 
 # Close the durable status decision a previous escalation opened for <corr_id>.
 # Idempotent, and safe to retry until it succeeds: it appends the closing line
-# only while that exact decision is still open in bin/fm-classify-lib.sh's fold,
-# so it can neither double-close nor close a different decision that has since
-# taken over the same key. Records that never escalated are left untouched.
+# only while that exact keyed decision is still open in
+# bin/fm-classify-lib.sh's fold. Records that never escalated and legacy
+# unkeyed escalations are left untouched.
 fm_pending_reply_close_escalation() {  # <state-dir> <corr_id>
   local state=$1 corr=$2 rec escalated closed parent_status escalation key note
   local open_line open_key open_note now
@@ -848,6 +846,7 @@ fm_pending_reply_close_escalation() {  # <state-dir> <corr_id>
   escalation=$(fm_pending_reply_escalation_line "$parent_status" "$corr")
   if [ -n "$escalation" ]; then
     key=$(_fm_decision_key "$escalation") || key=''
+    [ "$key" != default ] || return 0
     note=$(status_line_note "$escalation")
     while IFS= read -r open_line; do
       [ -n "$open_line" ] || continue

@@ -442,7 +442,7 @@ test_concurrent_resolution_closes_escalation_once() {
 }
 
 test_concurrent_escalation_yields_to_late_reply() {
-  local home state corr rec worker
+  local home state corr rec
   home=$(setup_parent concurrent-escalation)
   state="$home/state"
   export FM_PENDING_REPLY_NOW=4900
@@ -453,7 +453,7 @@ test_concurrent_escalation_yields_to_late_reply() {
   fm_pending_reply_set "$rec" recovery_turn_completed_epoch 4850
   printf 'done [corr=%s]: late concurrent reply\n' "$corr" > "$state/hibit.status"
 
-  for worker in 1 2 3 4 5 6 7 8; do
+  for _ in 1 2 3 4 5 6 7 8; do
     fm_pending_reply_maybe_escalate "$state" "$corr" &
     fm_pending_reply_try_resolve "$state" "$corr" &
   done

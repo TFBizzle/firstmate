@@ -17,10 +17,13 @@
 # The public surface never prints a secret: `exec` injects resolved values into
 # the child command's environment only, because a value printed to stdout lands
 # in agent transcripts, panes, and reports. There is deliberately no public
-# `get`. Without an active grant, `exec` execs `av inject +KEY... -- cmd`
-# directly - the value never transits this script on that path - after one loud
-# stderr line, so a headless lane does not wedge silently on the hidden av
-# dialog. Import runs `av inject +KEY -- fm-grant.sh _store KEY`: the value
+# `get`. `exec` is all-or-nothing: it locks every requested key, buffers every
+# value, and consumes uses only after each key proves active AND readable; if
+# ANY key is not usable it execs `av inject +KEY... -- cmd` for the FULL key
+# set - the value never transits this script on that path and NO use is
+# consumed for any key - after one loud stderr line, so a headless lane does
+# not wedge silently on the hidden av dialog.
+# Import runs `av inject +KEY -- fm-grant.sh _store KEY`: the value
 # travels env -> child -> `security` with no `sh -c`, no pipe, and no plaintext
 # on any file descriptor, and the av dialog legibly names `_store KEY`.
 #
@@ -42,6 +45,9 @@
 #   fm-grant.sh revoke KEY|--all     close the grant, KEEP the Keychain item
 #   fm-grant.sh forget KEY|--all     wipe the Keychain item and the record
 #
+# A `forget` whose Keychain delete really fails (anything but the benign
+# item-not-found exit 44) keeps the grant record, reports the item still
+# readable, and exits nonzero, so a failed revocation never looks completed.
 # `grant` requires --reason (the captain's words, logged and shown in status)
 # and at least one explicit bound. It warns - never blocks - on risky grant
 # shapes: --permanent, uses over 100, until over 30 days, and names on the
@@ -368,19 +374,6 @@ cmd_store() {
     || fail "Keychain write for $name failed"
 }
 
-grant_usable() { # <KEY> - active window AND a readable Keychain item
-  [ -f "$GRANTS_DIR/$1" ] || return 1
-  keychain_has "$1" || return 1
-  local usable=1
-  lock_key "$1"
-  expire_norm "$1"
-  if grant_active "$1"; then
-    usable=0
-  fi
-  unlock_key "$1"
-  return "$usable"
-}
-
 # No-grant path: one loud line so a headless lane does not wedge silently, then
 # exec av directly - the value never transits fm-grant here, and nothing is
 # consumed from any grant.
@@ -405,7 +398,7 @@ exec_av_fallback() { # <ungranted-list> <KEY>... -- <cmd>...
 }
 
 cmd_exec() {
-  local keys=() k ungranted='' v pairs=()
+  local keys=() uniq_keys=() vals=() pairs=() k v i unusable=''
   while [ $# -gt 0 ]; do
     case "$1" in
       --)
@@ -423,32 +416,48 @@ cmd_exec() {
   for k in "${keys[@]}"; do
     validate_key "$k"
   done
-  for k in "${keys[@]}"; do
-    if ! grant_usable "$k"; then
-      ungranted="$ungranted $k"
-    fi
-  done
-  if [ -n "$ungranted" ]; then
-    exec_av_fallback "$ungranted" "${keys[@]}" -- "$@"
-  fi
-  for k in "${keys[@]}"; do
+  # Names are ^[A-Z][A-Z0-9_]*$, so newline-splitting them is safe. The sorted
+  # dedup gives one lock/read/consume per key and one global lock order, so two
+  # overlapping execs cannot spin each other out on ABBA lock waits and the
+  # all-keys lock below never takes the same key's lock twice.
+  while IFS= read -r k; do
+    uniq_keys+=("$k")
+  done < <(printf '%s\n' "${keys[@]}" | LC_ALL=C sort -u)
+  # All-or-nothing: hold every key's lock across the whole read-and-decide so
+  # no other exec can consume in between, buffer each value, and consume uses
+  # only once every key has proven BOTH active and readable. Any unusable key
+  # - an inactive grant, or a vanished/empty value from a "forget" racing this
+  # window - sends the WHOLE exec through the av fallback for the full key
+  # set, consuming no use for any key.
+  for k in "${uniq_keys[@]}"; do
     lock_key "$k"
+  done
+  i=0
+  for k in "${uniq_keys[@]}"; do
     expire_norm "$k"
     if ! grant_active "$k"; then
-      # Raced to exhaustion since the check above. Earlier keys already left a
-      # use receipt each - acceptable for cooperative bookkeeping, and visible
-      # in the log next to this fallback line.
-      unlock_key "$k"
-      exec_av_fallback " $k" "${keys[@]}" -- "$@"
+      unusable="$unusable $k"
+    elif ! v=$(keychain_read "$k") || [ -z "$v" ]; then
+      unusable="$unusable $k"
+    else
+      vals[i]=$v
     fi
-    consume_use "$k"
-    unlock_key "$k"
+    i=$((i + 1))
   done
-  for k in "${keys[@]}"; do
-    if ! v=$(keychain_read "$k") || [ -z "$v" ]; then
-      exec_av_fallback " $k" "${keys[@]}" -- "$@"
-    fi
-    pairs+=("$k=$v")
+  if [ -n "$unusable" ]; then
+    for k in "${uniq_keys[@]}"; do
+      unlock_key "$k"
+    done
+    exec_av_fallback "$unusable" "${keys[@]}" -- "$@"
+  fi
+  i=0
+  for k in "${uniq_keys[@]}"; do
+    consume_use "$k"
+    pairs+=("$k=${vals[i]}")
+    i=$((i + 1))
+  done
+  for k in "${uniq_keys[@]}"; do
+    unlock_key "$k"
   done
   # env(1) carries the values straight into the child's environment; they are
   # never printed, logged, or exported into an intermediate shell.
@@ -531,19 +540,30 @@ cmd_revoke() {
 
 cmd_forget() {
   resolve_targets forget "$@"
-  local k note
+  local k note rc failed=0
   for k in "${TARGETS[@]}"; do
-    if security delete-generic-password -s "$SERVICE" -a "$k" >/dev/null 2>&1; then
-      note=removed
-    else
-      note=absent
-    fi
+    security delete-generic-password -s "$SERVICE" -a "$k" >/dev/null 2>&1
+    rc=$?
+    case "$rc" in
+      0) note=removed ;;
+      44) note=absent ;; # errSecItemNotFound: nothing left in the Keychain
+      *)
+        # A real delete failure (locked keychain, permissions): the item is
+        # still readable, so the grant record must survive to keep saying so,
+        # and this forget must not look like a completed revocation.
+        failed=1
+        log_event "forget $k keychain=error status=$rc"
+        printf 'fm-grant: ERROR: Keychain delete for %s failed (security exit %s) - the secret REMAINS silently readable and the grant record is kept; fix the Keychain and re-run "fm-grant.sh forget %s".\n' "$k" "$rc" "$k" >&2
+        continue
+        ;;
+    esac
     lock_key "$k"
     rm -f "$GRANTS_DIR/$k"
     unlock_key "$k"
     log_event "forget $k keychain=$note"
     printf 'fm-grant: forgot %s (Keychain item %s) - promptless access ended.\n' "$k" "$note"
   done
+  [ "$failed" = 0 ] || exit 1
 }
 
 SUB=${1-}

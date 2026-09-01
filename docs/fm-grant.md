@@ -22,6 +22,7 @@ No fm-grant output ever contains a value, and there is deliberately no public `g
 Without an active grant for every requested key, `exec` prints one loud stderr line and then execs `av inject +KEY... -- <cmd>` directly, so behavior degrades to the ordinary prompting path, no grant is consumed, and the value never transits fm-grant.
 Grant bounds (`--uses N`, `--until <N><s|m|h|d>`, `--permanent`) combine, and whichever limit comes first wins; a use is one key retrieval, and expiry is applied lazily on every exec and status.
 Risky grant shapes warn on stderr but never block: `--permanent`, uses over 100, deadlines past 30 days, and names on the small consequence list (PAYMENT, TEBEX, STRIPE, PROD, DEPLOY, SIGNING).
+When the Keychain refuses a real `forget` deletion (anything but an already-absent item), fm-grant keeps that grant record, reports that the secret remains readable, and exits nonzero, so a failed revocation is never mistaken for a completed one.
 
 ## Never bless fm-grant.sh
 

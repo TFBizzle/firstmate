@@ -441,13 +441,16 @@ cmd_exec() {
       unlock_key "$k"
       exec_av_fallback " $k" "${keys[@]}" -- "$@"
     fi
-    consume_use "$k"
-    unlock_key "$k"
-  done
-  for k in "${keys[@]}"; do
+    # Read the secret BEFORE consuming a use: if the value is gone (a "forget"
+    # raced this window) a failed or empty read must not burn a use. Same-key
+    # lock still held, so no other exec can consume between the read and the
+    # consume here.
     if ! v=$(keychain_read "$k") || [ -z "$v" ]; then
+      unlock_key "$k"
       exec_av_fallback " $k" "${keys[@]}" -- "$@"
     fi
+    consume_use "$k"
+    unlock_key "$k"
     pairs+=("$k=$v")
   done
   # env(1) carries the values straight into the child's environment; they are

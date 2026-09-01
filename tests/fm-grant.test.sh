@@ -275,6 +275,34 @@ assert_grep 'fallback ungranted=API_TOKEN' "$d/state/grants.log" 'fallback logge
 assert_no_value_leak "$d" "$SECRET" 'exec case'
 pass 'exec injects into the child env, decrements one use per retrieval, and exhausts to av'
 
+# --- a failed/empty read must NOT consume a use ------------------------------
+# Regression: exec used to consume a use in one loop and read the secret in a
+# separate later loop, so a "forget" racing that window burned a use without
+# ever delivering the value. The read now precedes the consume under the same
+# per-key lock, so a vanished value falls back to av while the grant is intact.
+
+d=$(new_case)
+printf '%s' "$SECRET" > "$d/avsecrets/RACE_KEY"
+printf '%s' "$SECRET" > "$d/expected-bytes"
+fmg "$d" grant RACE_KEY --uses 2 --reason 'captain: race window'
+expect_code 0 "$RC" 'setup grant for read-race case'
+[ "$(grant_field "$d" RACE_KEY uses_left)" = 2 ] || fail 'read-race grant starts with two uses'
+
+# The value disappears from the Keychain after the active grant still exists -
+# exactly the forget-vs-read race the bug burned a use on.
+rm -f "$d/keychain/RACE_KEY"
+
+# shellcheck disable=SC2016 # the child shell, not this test, expands the env var
+fmg "$d" exec RACE_KEY -- /bin/sh -c 'printf %s "$RACE_KEY" > "$1"' _ "$d/child-out"
+expect_code 0 "$RC" 'exec with a vanished value still completes through av'
+cmp -s "$d/child-out" "$d/expected-bytes" || fail 'fallback child got the value from av'
+[ "$(grant_field "$d" RACE_KEY uses_left)" = 2 ] || fail 'a failed/empty read consumes no use'
+assert_no_grep 'use RACE_KEY' "$d/state/grants.log" 'no use receipt logged for the vanished read'
+assert_grep 'no active grant for RACE_KEY' "$d/err" 'vanished-value exec falls back loudly'
+assert_grep 'inject +RACE_KEY -- /bin/sh' "$d/av.log" 'fallback execs av inject with the command directly'
+assert_no_value_leak "$d" "$SECRET" 'read-race case'
+pass 'a failed or empty Keychain read falls back to av and consumes no use'
+
 # --- combined uses+deadline: whichever limit comes first wins ----------------
 
 d=$(new_case)

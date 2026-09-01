@@ -17,7 +17,12 @@
 #   - the no-grant fallback execs `av inject +KEY... -- cmd` directly, prints
 #     one loud stderr line, consumes nothing, and the value never transits
 #     fm-grant.
+#   - a multi-key exec is all-or-nothing: any unusable key sends the whole
+#     exec through the av fallback with no use consumed for any key.
 #   - revoke ends the window but keeps the item; forget wipes both.
+#   - a forget whose Keychain delete really fails (non-44) keeps the record,
+#     reports the item still readable, and exits nonzero; already-absent (44)
+#     stays a clean removal.
 #   - concurrent execs decrement exactly once each (the mkdir-spinlock proof).
 #   - grant-shape warnings (--permanent, uses>100, until>30d, consequence-
 #     listed names) warn without blocking, and a plain API key stays quiet.
@@ -36,14 +41,17 @@ SECRET='s3cr3t-value-du2ok9-never-in-output'
 # --- shared fakebin shims ----------------------------------------------------
 #
 # Both shims are pure functions of per-case env (FAKE_KEYCHAIN, FAKE_AV_SECRETS,
-# AV_LOG), so one shared fakebin dir serves every case.
+# AV_LOG, FAKE_SECURITY_DELETE_FAIL), so one shared fakebin dir serves every
+# case.
 
 FAKEBIN="$TMP_ROOT/fakebin"
 mkdir -p "$FAKEBIN"
 
 # Fake macOS `security` backed by $FAKE_KEYCHAIN/<account> files holding the
 # exact stored bytes. find -w prints the value plus the real tool's trailing
-# newline; a missing item exits 44 like errSecItemNotFound.
+# newline; a missing item exits 44 like errSecItemNotFound; setting
+# FAKE_SECURITY_DELETE_FAIL=<account>:<code> makes that account's delete fail
+# with <code>, emulating a real-world stuck delete (locked keychain, denied).
 cat > "$FAKEBIN/security" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -86,6 +94,9 @@ case "$cmd" in
     printf '%s' "$add_value" > "$item"
     ;;
   delete-generic-password)
+    case "${FAKE_SECURITY_DELETE_FAIL:-}" in
+      "$account":*) exit "${FAKE_SECURITY_DELETE_FAIL#*:}" ;;
+    esac
     [ -f "$item" ] || exit 44
     rm -f "$item"
     ;;
@@ -303,6 +314,50 @@ assert_grep 'inject +RACE_KEY -- /bin/sh' "$d/av.log" 'fallback execs av inject 
 assert_no_value_leak "$d" "$SECRET" 'read-race case'
 pass 'a failed or empty Keychain read falls back to av and consumes no use'
 
+# --- multi-key exec is all-or-nothing: a bad later key consumes nothing ------
+# Regression: exec used to consume each key's use as it walked the key list, so
+# a later key failing its read still left the earlier keys' uses spent even
+# though the whole exec then fell back through av. The buffered
+# read-everything-then-consume ordering under all the key locks means any
+# unusable key falls the WHOLE exec back with no use consumed for any key.
+
+d=$(new_case)
+printf '%s' "$SECRET" > "$d/avsecrets/AAA_KEY"
+printf '%s' 'zzz-value-plain' > "$d/avsecrets/ZZZ_BAD"
+fmg "$d" grant AAA_KEY --uses 3 --reason 'captain: pair one'
+expect_code 0 "$RC" 'setup first grant for the all-or-nothing case'
+fmg "$d" grant ZZZ_BAD --uses 2 --reason 'captain: pair two'
+expect_code 0 "$RC" 'setup second grant for the all-or-nothing case'
+
+# The later key's stored value becomes empty - an item that still exists (so
+# any upfront existence check passes) but whose read is unusable, discovered
+# only after the earlier key was already read.
+: > "$d/keychain/ZZZ_BAD"
+
+# shellcheck disable=SC2016 # the child shell, not this test, expands the env var
+fmg "$d" exec AAA_KEY ZZZ_BAD -- /bin/sh -c 'printf "%s:%s" "$AAA_KEY" "$ZZZ_BAD" > "$1"' _ "$d/child-out"
+expect_code 0 "$RC" 'exec with one unreadable key still completes through av'
+printf '%s:%s' "$SECRET" 'zzz-value-plain' > "$d/expected-bytes"
+cmp -s "$d/child-out" "$d/expected-bytes" || fail 'fallback child got every value from av'
+[ "$(grant_field "$d" AAA_KEY uses_left)" = 3 ] || fail 'the readable earlier key consumed no use'
+[ "$(grant_field "$d" ZZZ_BAD uses_left)" = 2 ] || fail 'the unreadable later key consumed no use'
+assert_no_grep 'use AAA_KEY' "$d/state/grants.log" 'no use receipt for the earlier key'
+assert_no_grep 'use ZZZ_BAD' "$d/state/grants.log" 'no use receipt for the later key'
+assert_grep 'no active grant for ZZZ_BAD' "$d/err" 'the unusable key is named loudly'
+assert_grep 'inject +AAA_KEY +ZZZ_BAD -- /bin/sh' "$d/av.log" 'fallback hands av the FULL key set'
+assert_grep 'fallback ungranted=ZZZ_BAD' "$d/state/grants.log" 'fallback logged'
+
+# Same all-or-nothing rule when the later key is merely inactive (revoked).
+printf '%s' 'zzz-value-plain' > "$d/keychain/ZZZ_BAD"
+fmg "$d" revoke ZZZ_BAD
+expect_code 0 "$RC" 'revoke the later key'
+fmg "$d" exec AAA_KEY ZZZ_BAD -- /usr/bin/true
+expect_code 0 "$RC" 'exec with one revoked key still completes through av'
+[ "$(grant_field "$d" AAA_KEY uses_left)" = 3 ] || fail 'a revoked later key consumes nothing for the earlier key'
+assert_no_grep 'use AAA_KEY' "$d/state/grants.log" 'still no use receipt after the revoked-key fallback'
+assert_no_value_leak "$d" "$SECRET" 'all-or-nothing case'
+pass 'a multi-key exec with any unusable key falls back whole and consumes no use'
+
 # --- combined uses+deadline: whichever limit comes first wins ----------------
 
 d=$(new_case)
@@ -390,6 +445,61 @@ assert_absent "$d/state/grants/ROT_KEY" 'forget removes the grant record'
 assert_grep 'forget ROT_KEY keychain=removed' "$d/state/grants.log" 'forget logged'
 assert_no_value_leak "$d" "$SECRET" 'revoke/forget case'
 pass 'revoke keeps the Keychain item while forget wipes it and the record'
+
+# --- forget: a real Keychain delete failure must not report revocation -------
+# Regression: every nonzero delete was lumped into "absent", so a locked
+# keychain or permission failure still removed the grant record and reported
+# access ended while the secret stayed silently readable. Only exit 44 (item
+# not found) is benign; any other failure keeps the record, says the item
+# REMAINS readable, and exits nonzero.
+
+d=$(new_case)
+printf '%s' "$SECRET" > "$d/avsecrets/AAA_STUCK"
+printf '%s' "$SECRET" > "$d/avsecrets/ZZZ_OK"
+fmg "$d" grant AAA_STUCK --uses 3 --reason 'captain: stuck'
+expect_code 0 "$RC" 'setup first grant for the forget-failure case'
+fmg "$d" grant ZZZ_OK --uses 3 --reason 'captain: fine'
+expect_code 0 "$RC" 'setup second grant for the forget-failure case'
+
+export FAKE_SECURITY_DELETE_FAIL='AAA_STUCK:36'
+fmg "$d" forget AAA_STUCK
+expect_code 1 "$RC" 'forget exits nonzero on a real Keychain delete failure'
+assert_present "$d/keychain/AAA_STUCK" 'the failed delete leaves the Keychain item'
+assert_present "$d/state/grants/AAA_STUCK" 'the failed delete keeps the grant record'
+assert_grep 'REMAINS silently readable' "$d/err" 'the failure says the secret is still readable'
+assert_no_grep 'promptless access ended' "$d/out" 'a failed forget never reports access ended'
+assert_no_grep 'promptless access ended' "$d/err" 'a failed forget never reports access ended on stderr'
+assert_grep 'forget AAA_STUCK keychain=error status=36' "$d/state/grants.log" 'the failure is logged with the real status'
+
+# --all reports the stuck key, still forgets the healthy one, and exits
+# nonzero - one real failure must not silently skip the rest.
+fmg "$d" forget --all
+expect_code 1 "$RC" 'forget --all exits nonzero when any key really fails'
+assert_present "$d/state/grants/AAA_STUCK" '--all keeps the stuck record'
+assert_grep 'REMAINS silently readable' "$d/err" '--all reports the stuck key'
+assert_absent "$d/state/grants/ZZZ_OK" '--all still removes the healthy record'
+assert_absent "$d/keychain/ZZZ_OK" '--all still wipes the healthy item'
+assert_grep 'forget ZZZ_OK keychain=removed' "$d/state/grants.log" 'the healthy removal is logged'
+
+# Once the Keychain cooperates again, the same forget completes cleanly.
+unset FAKE_SECURITY_DELETE_FAIL
+fmg "$d" forget AAA_STUCK
+expect_code 0 "$RC" 'forget succeeds once the delete works'
+assert_absent "$d/keychain/AAA_STUCK" 'the retried forget wipes the item'
+assert_absent "$d/state/grants/AAA_STUCK" 'the retried forget removes the record'
+
+# Exit 44 (item already absent) stays a benign, record-removing forget.
+printf '%s' "$SECRET" > "$d/avsecrets/GONE_KEY"
+fmg "$d" grant GONE_KEY --uses 2 --reason 'captain: gone'
+expect_code 0 "$RC" 'setup grant for the absent-item forget'
+rm -f "$d/keychain/GONE_KEY"
+fmg "$d" forget GONE_KEY
+expect_code 0 "$RC" 'forget of an already-absent item stays clean'
+assert_absent "$d/state/grants/GONE_KEY" 'the absent-item forget removes the record'
+assert_grep 'forget GONE_KEY keychain=absent' "$d/state/grants.log" 'the absent item is logged as absent'
+assert_grep 'promptless access ended' "$d/out" 'the absent-item forget reports access ended'
+assert_no_value_leak "$d" "$SECRET" 'forget-failure case'
+pass 'forget treats only exit 44 as benign and never reports a failed revocation as done'
 
 # --- concurrent execs decrement exactly once each (spinlock proof) -----------
 

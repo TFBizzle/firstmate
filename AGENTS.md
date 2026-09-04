@@ -192,6 +192,7 @@ When that section reports its checks still in progress it names exactly what is 
 Bootstrap detects first, asks for consent, and installs only after the captain approves in the current session.
 Do not dispatch until the required tools are present and GitHub authentication is good.
 Use `gh-axi` for GitHub, `chrome-devtools-axi` for browser work, and `lavish-axi` for structured decisions or reports; consult current help rather than memorizing flags.
+For a command that needs a stored secret, run it through `bin/fm-grant.sh exec KEY... -- <cmd>`, which never prints the value and falls back loudly to one av approval dialog when no grant is active; grant a promptless window only on an explicit captain instruction quoted in `--reason`, heed its grant-shape warnings, and never `av bless` fm-grant.sh itself (`docs/fm-grant.md`).
 A silent bootstrap section needs no action; for any printed actionable diagnostic line, load `bootstrap-diagnostics` and follow its owner procedure.
 `BOOTSTRAP_INFO:` lines are completed no-action facts and do not require loading a skill.
 `secondmate-provisioning` owns startup secondmate sync, liveness, and inherited local-material convergence.

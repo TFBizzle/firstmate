@@ -337,6 +337,10 @@
       "audience": "operator-example"
     },
     {
+      "path": "docs/fm-grant.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/fm-test-isolation-proof.md",
       "audience": "maintainer-verification"
     },

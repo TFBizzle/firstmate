@@ -14,6 +14,11 @@
 #   status  Answer "what is happening" from durable records ONLY. Reads no
 #           network and appends NO wake, so it never interrupts work and is safe
 #           to run in a loop.
+#   reply   Publish firstmate's answer to a note id as a durable record the
+#           submitter can read at state/inbox/.replies/<id>. Each reply is
+#           stamped with a durable per-home sequence so two replies recorded in
+#           the same second are both readable. One reply per note: a second one
+#           is refused, as is an unknown id or an empty body. Appends NO wake.
 #   ask     Answer a side question with a one-shot model call that never touches
 #           firstmate, the backlog, or the wake queue. A side question is not
 #           fleet work and must not become fleet work.
@@ -21,6 +26,7 @@
 # Usage:
 #   fm-inbox.sh note <text>...          | fm-inbox.sh note -   (body from stdin)
 #   fm-inbox.sh say  [<file.wav>]       (default: audio on stdin)
+#   fm-inbox.sh reply <id> <text>...   | fm-inbox.sh reply <id> -   (body from stdin)
 #   fm-inbox.sh status
 #   fm-inbox.sh ask  <question>...
 #   fm-inbox.sh list
@@ -41,7 +47,7 @@
 # An absent profile means the call uses whatever credentials are already in the
 # environment, which is also what FM_INBOX_PROFILE= (empty) forces.
 #
-# `note`, `status`, `list` and `drain` need NO configuration at all, because they
+# `note`, `reply`, `status`, `list` and `drain` need NO configuration at all, because they
 # make no model call. The voice handover depends on `note`, so it keeps working in
 # a home that has configured nothing.
 #
@@ -49,7 +55,7 @@
 #   FM_HOME              operational home whose state/ and data/ are used.
 #
 # PRIVACY: `say` sends your audio and `ask` sends your question to Bedrock.
-# `note`, `status`, `list` and `drain` make no network call at all.
+# `note`, `reply`, `status`, `list` and `drain` make no network call at all.
 #
 # `note` is also the queueing half of the spoken interface: when the voice agent
 # in bin/fm-voice-relay.py hands real work over to firstmate, it runs this
@@ -80,6 +86,8 @@ FM_HOME="${FM_HOME:-$FM_ROOT}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 INBOX="$STATE/inbox"
+REPLIES="$INBOX/.replies"
+REPLY_SEQ_LOCK="$INBOX/.replies.lock"
 
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 
@@ -205,6 +213,111 @@ cmd_note() {
     body="$*"
   fi
   queue_note text "$body"
+}
+
+# ---------------------------------------------------------------- reply
+
+load_wake_lib() {
+  local lib="$FM_ROOT/bin/fm-wake-lib.sh"
+  [ "${FM_INBOX_WAKE_LIB:-}" = 1 ] && return 0
+  [ -r "$lib" ] || return 1
+  # shellcheck source=bin/fm-wake-lib.sh
+  FM_ROOT_OVERRIDE="$FM_ROOT" FM_HOME="$FM_HOME" STATE="$STATE" . "$lib"
+  FM_INBOX_WAKE_LIB=1
+}
+
+valid_note_id() {
+  case "$1" in
+    ''|*/*|*[[:space:]]*|*..*) return 1 ;;
+  esac
+  case "$1" in
+    *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+note_path() {  # <id>
+  if [ -f "$INBOX/$1.note" ]; then
+    printf '%s\n' "$INBOX/$1.note"
+  elif [ -f "$INBOX/handled/$1.note" ]; then
+    printf '%s\n' "$INBOX/handled/$1.note"
+  else
+    return 1
+  fi
+}
+
+# Claim the next reply sequence. The caller holds REPLY_SEQ_LOCK across the
+# claim AND the record write, so a reply a reader can see implies every lower
+# sequence is already readable: the cursor stays a strict total order.
+# The claim is above both the counter and every recorded reply, and the counter
+# is replaced by rename, so a torn or lost counter can never move it backwards.
+next_reply_seq() {
+  local seq_file="$REPLIES/.seq" seq recorded tmp
+  seq=$(cat "$seq_file" 2>/dev/null || printf '0')
+  case "$seq" in
+    ''|*[!0-9]*) seq=0 ;;
+  esac
+  recorded=$(find "$REPLIES" -maxdepth 1 -type f ! -name '.*' -exec awk '
+    FNR == 1 { head = 1 }
+    /^--$/ { head = 0 }
+    head && /^seq=[0-9]+$/ { v = substr($0, 5) + 0; if (v > max) max = v }
+    END { print max + 0 }' {} + 2>/dev/null | sort -n | tail -n 1)
+  case "$recorded" in
+    ''|*[!0-9]*) recorded=0 ;;
+  esac
+  [ "$recorded" -le "$seq" ] || seq=$recorded
+  seq=$((seq + 1))
+  tmp=$(mktemp "$REPLIES/.seq-XXXXXX") || return 1
+  if ! printf '%s\n' "$seq" >"$tmp" || ! mv "$tmp" "$seq_file"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  printf '%s\n' "$seq"
+}
+
+cmd_reply() {
+  local id body staging seq
+  id=${1:-}
+  [ -n "$id" ] || die "usage: fm-inbox.sh reply <id> <text>... (or: reply <id> -)"
+  shift
+  valid_note_id "$id" || die "invalid note id"
+  note_path "$id" >/dev/null || die "no such note: $id"
+  if [ "$#" -eq 0 ]; then
+    die "usage: fm-inbox.sh reply <id> <text>... (or: reply <id> -)"
+  elif [ "$1" = "-" ]; then
+    [ "$#" -eq 1 ] || die "usage: fm-inbox.sh reply <id> -"
+    body=$(cat; printf .)
+    body=${body%.}
+  else
+    body="$*"
+  fi
+  [ -n "${body//[[:space:]]/}" ] || die "refusing to record an empty reply"
+  mkdir -p "$REPLIES"
+  load_wake_lib || die "the reply sequence needs $FM_ROOT/bin/fm-wake-lib.sh"
+  fm_lock_acquire_wait "$REPLY_SEQ_LOCK" || die "could not claim the reply sequence"
+  if [ -f "$REPLIES/$id" ]; then
+    fm_lock_release "$REPLY_SEQ_LOCK"
+    die "reply already recorded for $id"
+  fi
+  if ! seq=$(next_reply_seq); then
+    fm_lock_release "$REPLY_SEQ_LOCK"
+    die "could not claim the reply sequence"
+  fi
+  staging=$(mktemp "$REPLIES/.staging-XXXXXX")
+  {
+    printf 'id=%s\n' "$id"
+    printf 'at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'seq=%s\n' "$seq"
+    printf -- '--\n'
+    printf '%s' "$body"
+    case "$body" in
+      *$'\n') ;;
+      *) printf '\n' ;;
+    esac
+  } >"$staging"
+  mv "$staging" "$REPLIES/$id"
+  fm_lock_release "$REPLY_SEQ_LOCK"
+  printf 'replied %s\n' "$id"
 }
 
 # ---------------------------------------------------------------- say
@@ -381,6 +494,7 @@ cmd_drain() {
 
 case "${1:-}" in
   note)   shift; cmd_note "$@" ;;
+  reply)  shift; cmd_reply "$@" ;;
   say)    shift; cmd_say "$@" ;;
   status) shift; cmd_status ;;
   ask)    shift; cmd_ask "$@" ;;

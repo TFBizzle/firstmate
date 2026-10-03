@@ -33,7 +33,7 @@ test_reply_writes_record() {
   [ "$(sed -n 3p "$file")" = "seq=1" ] || fail "third line is seq=1"
   [ "$(sed -n 4p "$file")" = "--" ] || fail "fourth line is the separator"
   [ "$(sed -n '5,$p' "$file")" = $'line one\nline two' ] || fail "body is byte-exact"
-  [ "$(stat -f %Lp "$file" 2>/dev/null || stat -c %a "$file")" = 600 ] \
+  [ "$(stat -c %a "$file" 2>/dev/null || stat -f %Lp "$file")" = 600 ] \
     || fail "reply record is private"
   pass "reply writes the record in the inbox reply format"
 }

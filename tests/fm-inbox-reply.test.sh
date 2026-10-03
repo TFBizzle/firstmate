@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/fm-inbox.test.sh - bin/fm-inbox.sh's reply record: one durable answer
+# tests/fm-inbox-reply.test.sh - bin/fm-inbox.sh's reply record: one durable answer
 # per known note id, written in the header's id/at/seq/--/body format.
 set -u
 
@@ -7,7 +7,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 INBOX_SH="$ROOT/bin/fm-inbox.sh"
-TMP_ROOT=$(fm_test_tmproot fm-inbox)
+TMP_ROOT=$(fm_test_tmproot fm-inbox-reply)
 
 new_home() {  # <name>: a fresh home with one queued note; prints "<home> <id>"
   local home="$TMP_ROOT/$1" out id
